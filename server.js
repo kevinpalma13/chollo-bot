@@ -40,6 +40,21 @@ app.get("/", (_req, res) => res.type("text").send("OK - Auto Chollometro"));
 app.get("/publish", async (req, res) => {
   try {
     if (!SECRET) return res.status(500).json({ ok: false, error: "SECRET_missing" });
+
+    // DEBUG: imprime lo que llegó (NO imprime el SECRET)
+    console.log("RAW req.url:", req.url);
+
+    // Reproduce el mismo cálculo que hace verifySignature para ver qué QS y firma espera
+    const u = new URL(req.url, "http://dummy");
+    const entries = [];
+    for (const [k, v] of u.searchParams.entries()) if (k !== "sig") entries.push([k, v]);
+    entries.sort((a,b) => a[0].localeCompare(b[0]));
+    const qsServer = entries.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
+    const mac = crypto.createHmac("sha256", SECRET).update(qsServer).digest("base64url");
+    console.log("SERVER qs=", qsServer);
+    console.log("SERVER sig=", mac);
+    console.log("CLIENT sig=", u.searchParams.get("sig"));
+
     // Verifica firma
     if (!verifySignature(req.url)) return res.status(401).json({ ok: false, error: "bad_signature" });
 
