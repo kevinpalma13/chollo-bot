@@ -5,44 +5,69 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ======================
-   RUTA DE PRUEBA
-   ====================== */
-app.get("/", (req, res) => {
-  res.send("OK - Scraper Miravia activo");
+// Modo debug opcional: añade en Render la env DEBUG=1 para ver más logs
+const DEBUG = process.env.DEBUG === "1";
+
+app.get("/", (_req, res) => {
+  res.type("text").send("OK - Scraper Miravia activo");
 });
 
-/* ======================
-   SCRAPER DE MIRAVIA
-   ====================== */
 app.get("/miravia/flashsale.json", async (req, res) => {
-  const MAX_ITEMS = Number(req.query.max || 10); // por defecto 10
+  const MAX_ITEMS = Number(req.query.max || 10);
   let browser;
   try {
-    browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({
-      viewport: { width: 1280, height: 900 },
-    });
-    const page = await context.newPage();
+    if (DEBUG) console.log("[MIRAVIA] Iniciando navegador…");
 
-    // 1) Ir a la lista de flash sale
+    browser = await chromium.launch({
+      headless: true,
+      // En algunos hosts conviene desactivar sandbox
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+
+    const context = await browser.newContext({
+      viewport: { width: 1366, height: 900 },
+      locale: "es-ES",
+      timezoneId: "Europe/Madrid",
+      geolocation: { latitude: 40.4168, longitude: -3.7038 }, // Madrid (no siempre necesario)
+      permissions: ["geolocation"],
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    });
+
+    const page = await context.newPage();
+    page.setDefaultTimeout(45000);
+    page.setDefaultNavigationTimeout(45000);
+
+    // Algunas webs son sensibles a cabeceras
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache",
+      DNT: "1",
+    });
+
+    if (DEBUG) console.log("[MIRAVIA] Abriendo lista…");
     await page.goto("https://www.miravia.es/flashsale/home", {
       waitUntil: "domcontentloaded",
-      timeout: 45000,
     });
 
-    // Si el sitio nos manda a captcha/antibot
-    if (/punish|captcha/i.test(page.url())) {
+    const current = page.url();
+    if (DEBUG) console.log("[MIRAVIA] URL actual:", current);
+
+    // Si el sitio devuelve paso anti-bot
+    if (/punish|captcha/i.test(current)) {
+      if (DEBUG) console.log("[MIRAVIA] Captcha/antibot detectado en lista");
       await browser.close();
       return res
         .status(503)
         .json({ ok: false, error: "captcha_or_antibot", items: [] });
     }
 
-    // 2) Esperar a que aparezcan productos
+    // Espera a que aparezcan productos
+    if (DEBUG) console.log("[MIRAVIA] Esperando selectores de producto…");
     await page.waitForSelector('a[data-spm="dproduct"]', { timeout: 20000 });
 
-    // 3) Extraer tarjetas
+    // Extraer tarjetas en el cliente
     const cards = await page.$$eval('a[data-spm="dproduct"]', (nodes) => {
       const out = [];
       for (const a of nodes) {
@@ -52,13 +77,9 @@ app.get("/miravia/flashsale.json", async (req, res) => {
           ? titleEl.textContent.trim().replace(/\s+/g, " ")
           : "";
 
-        // Precio actual
-        const pi = a.querySelector(
-          ".lte_product_card_price_main_integer"
-        );
-        const pd = a.querySelector(
-          ".lte_product_card_price_main_decimal"
-        );
+        // Precio actual integer+decimal
+        const pi = a.querySelector(".lte_product_card_price_main_integer");
+        const pd = a.querySelector(".lte_product_card_price_main_decimal");
         let priceNow = null;
         if (pi) {
           const i = (pi.textContent || "").replace(/\D+/g, "");
@@ -95,20 +116,22 @@ app.get("/miravia/flashsale.json", async (req, res) => {
       return out;
     });
 
-    // 4) Limitar número de productos
+    if (DEBUG) console.log("[MIRAVIA] Tarjetas encontradas:", cards.length);
+
     const slice = cards.slice(0, MAX_ITEMS);
 
-    // 5) Abrir detalle de cada producto
     const results = [];
     for (const it of slice) {
       try {
+        if (DEBUG) console.log("[MIRAVIA] Detalle →", it.url);
         const p2 = await context.newPage();
-        await p2.goto(it.url, {
-          waitUntil: "domcontentloaded",
-          timeout: 45000,
-        });
+        p2.setDefaultTimeout(40000);
+        p2.setDefaultNavigationTimeout(40000);
+        await p2.goto(it.url, { waitUntil: "domcontentloaded" });
 
-        if (/punish|captcha/i.test(p2.url())) {
+        const u2 = p2.url();
+        if (/punish|captcha/i.test(u2)) {
+          if (DEBUG) console.log("[MIRAVIA] Captcha/antibot en detalle, salto:", u2);
           await p2.close();
           continue;
         }
@@ -116,13 +139,13 @@ app.get("/miravia/flashsale.json", async (req, res) => {
         // Descripción
         let desc = "";
         try {
-          await p2.waitForSelector("#module_product-details", {
-            timeout: 12000,
-          });
+          await p2.waitForSelector("#module_product-details", { timeout: 15000 });
           desc = await p2.$eval("#module_product-details", (n) =>
             n.innerText.replace(/\s+/g, " ").trim()
           );
-        } catch (_) {}
+        } catch (e) {
+          if (DEBUG) console.log("[MIRAVIA] Sin módulo de detalles:", e.message);
+        }
 
         // Imagen
         let image = "";
@@ -134,7 +157,9 @@ app.get("/miravia/flashsale.json", async (req, res) => {
               (await imgEl.getAttribute("data-src")) ||
               "";
           }
-        } catch (_) {}
+        } catch (e) {
+          if (DEBUG) console.log("[MIRAVIA] Sin imagen principal:", e.message);
+        }
 
         results.push({
           ...it,
@@ -144,22 +169,22 @@ app.get("/miravia/flashsale.json", async (req, res) => {
 
         await p2.close();
       } catch (e) {
-        console.error("Error en detalle:", e);
+        console.error("[MIRAVIA] Error en detalle:", e.message);
       }
     }
 
     await browser.close();
+    if (DEBUG) console.log("[MIRAVIA] Done. Items:", results.length);
+
     return res.json({ ok: true, items: results });
   } catch (e) {
     if (browser) await browser.close();
-    console.error("Error general:", e);
+    console.error("[MIRAVIA] ERROR GENERAL:", e.stack || e.message || e);
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-/* ======================
-   Helper para resumen
-   ====================== */
+// Helper resumen ~150 palabras
 function summarize150(text) {
   if (!text) return "";
   const words = text.trim().split(/\s+/);
@@ -167,9 +192,6 @@ function summarize150(text) {
   return words.slice(0, 150).join(" ") + "…";
 }
 
-/* ======================
-   Arrancar servidor
-   ====================== */
 app.listen(PORT, () => {
   console.log("Servidor Miravia activo en puerto", PORT);
 });
